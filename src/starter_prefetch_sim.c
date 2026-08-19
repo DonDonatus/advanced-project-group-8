@@ -2,23 +2,13 @@
  * starter_prefetch_sim.c
  * CPEN 438 Project 8 -- "Ahead of the Storm"
  *
- * Week 2 starter code. This file already contains, fully working:
- *   - a base cache (same design as demo_prefetcher.c)
- *   - an MLP (Memory-Level Parallelism) tracker
- *   - the next-line prefetcher (PREFETCH_NEXTLINE), copied from the demo
- *
- * Your job (the two TODO sections, search for "TODO"):
- *   1. PREFETCH_STRIDE      -- a stride-detecting prefetcher
- *   2. PREFETCH_STREAMBUF   -- a Jouppi-style stream-buffer prefetcher
+ * Week 2 -- stride and stream-buffer prefetchers implemented.
  *
  * Build:
- *   gcc -O2 -o prefetch_sim starter_prefetch_sim.c
+ *   gcc -O2 -Wall -o prefetch_sim starter_prefetch_sim.c
  * Run:
  *   ./prefetch_sim <trace_file> <mode>
  *   where <mode> is one of: none | nextline | stride | streambuf
- *
- * Example:
- *   ./prefetch_sim rainfall.trace stride
  */
 
 #include <stdio.h>
@@ -38,7 +28,7 @@ typedef enum {
 } prefetch_mode_t;
 
 /* ---------------------------------------------------------------- */
-/* Base cache -- do not need to modify this section                 */
+/* Base cache -- unchanged from the starter                          */
 /* ---------------------------------------------------------------- */
 
 typedef struct {
@@ -51,7 +41,7 @@ typedef struct {
 
 static cache_line_t cache[NUM_LINES];
 static long global_tick = 0;
-static long outstanding_prefetches = 0;  /* declared here so cache_pick_victim() can use it */
+static long outstanding_prefetches = 0;
 
 static long stat_accesses          = 0;
 static long stat_hits              = 0;
@@ -91,8 +81,6 @@ static int cache_pick_victim(void) {
     }
     if (cache[victim].valid && cache[victim].was_prefetched && !cache[victim].prefetch_used) {
         stat_prefetches_wasted++;
-        /* This prefetch is leaving the cache without ever being used --
-         * it stops being "outstanding" now, whether it was useful or not. */
         if (outstanding_prefetches > 0) outstanding_prefetches--;
     }
     return victim;
@@ -110,14 +98,7 @@ static void cache_insert(long line_addr, int is_prefetch) {
 }
 
 /* ---------------------------------------------------------------- */
-/* MLP (Memory-Level Parallelism) tracker -- do not need to modify   */
-/*                                                                    */
-/* Simplified model: every prefetch we issue that has NOT yet been   */
-/* consumed by a demand access counts as one "outstanding" memory     */
-/* request running in the background while the program keeps going.  */
-/* MLP = the average number of such outstanding requests, sampled     */
-/* once per access. Higher MLP means prefetching is successfully      */
-/* overlapping multiple memory requests instead of serialising them.  */
+/* MLP tracker -- unchanged from the starter                         */
 /* ---------------------------------------------------------------- */
 
 static double mlp_sum = 0.0;
@@ -129,7 +110,7 @@ static void mlp_sample(void) {
 }
 
 /* ---------------------------------------------------------------- */
-/* PREFETCH_NEXTLINE -- fully working, provided as your reference    */
+/* PREFETCH_NEXTLINE -- unchanged reference implementation           */
 /* ---------------------------------------------------------------- */
 
 static void next_line_prefetch(long missed_line_addr) {
@@ -141,37 +122,7 @@ static void next_line_prefetch(long missed_line_addr) {
 }
 
 /* ---------------------------------------------------------------- */
-/* PREFETCH_STRIDE -- TODO: implement this                           */
-/*                                                                    */
-/* Idea: keep track of the last TWO miss addresses. If the distance   */
-/* (stride) between them is the same as the distance between the      */
-/* previous pair, we've detected a repeating stride -- prefetch        */
-/* (current_miss + stride).                                            */
-/*                                                                    */
-/* Why wait for confirmation instead of guessing after one miss?      */
-/* Because a single miss tells you nothing about direction or step    */
-/* size -- you need at least two data points to compute a stride at   */
-/* all, and a third to gain any confidence it's a *repeating* pattern */
-/* rather than a coincidence.                                          */
-/*                                                                    */
-/* Suggested state to keep (module-level, like the globals above):    */
-/*   static long last_miss_addr = -1;                                 */
-/*   static long last_stride = 0;                                     */
-/*                                                                    */
-/* Suggested logic inside stride_prefetch(long missed_line_addr):     */
-/*   1. if last_miss_addr != -1:                                      */
-/*        long stride = missed_line_addr - last_miss_addr;            */
-/*        if stride == last_stride and stride != 0:                   */
-/*            // confirmed repeating stride -- prefetch ahead          */
-/*            long target = missed_line_addr + stride;                 */
-/*            if (cache_find(target) == -1) {                          */
-/*                cache_insert(target, 1);                              */
-/*                outstanding_prefetches++;                             */
-/*            }                                                         */
-/*        last_stride = stride;                                        */
-/*   2. last_miss_addr = missed_line_addr;                             */
-/*                                                                    */
-/* Verify this against your Week 1 hand-trace before moving on.       */
+/* PREFETCH_STRIDE -- IMPLEMENTED                                    */
 /* ---------------------------------------------------------------- */
 
 static long last_miss_addr = -1;
@@ -192,45 +143,8 @@ static void stride_prefetch(long missed_line_addr) {
     last_miss_addr = missed_line_addr;
 }
 
-static void stride_prefetch(long missed_line_addr) {
-    (void)missed_line_addr;
-    /* TODO: replace this stub with the logic described above */
-}
-
 /* ---------------------------------------------------------------- */
-/* PREFETCH_STREAMBUF -- TODO: implement this (Jouppi, ISCA '90)     */
-/*                                                                    */
-/* Idea: keep a SEPARATE small FIFO queue of lines, distinct from     */
-/* the main cache. On a miss, start filling the stream buffer with    */
-/* the next STREAMBUF_DEPTH sequential lines ahead of the miss.       */
-/* On EVERY access (not just misses!) check the stream buffer FIRST:  */
-/* if the requested line is sitting in the stream buffer, that is a   */
-/* stream-buffer hit -- move that line into the main cache, and shift */
-/* the stream buffer forward by fetching one more line at the far end */
-/* to keep it full. This "check on every access, not just misses" is  */
-/* the detail teams most often get wrong -- a stream buffer that only */
-/* gets checked on cache misses will silently perform worse than it   */
-/* should.                                                             */
-/*                                                                    */
-/* Suggested state:                                                    */
-/*   static long stream_buf[STREAMBUF_DEPTH];                          */
-/*   static int  stream_buf_valid[STREAMBUF_DEPTH];                    */
-/*   static long stream_buf_next_fetch = -1; // next line to top up   */
-/*                                                                    */
-/* Suggested logic, called for EVERY access (not just misses), before */
-/* the normal cache lookup:                                            */
-/*   1. Search stream_buf[] for line_addr.                             */
-/*      If found: remove it from the stream buffer, insert it into    */
-/*      the main cache as a prefetch hit (is_prefetch=1, and credit    */
-/*      it useful immediately since it's being used right now), then  */
-/*      slide the buffer: fetch stream_buf_next_fetch into the freed   */
-/*      slot and increment stream_buf_next_fetch.                      */
-/*   2. If it was a genuine MISS in both cache and stream buffer:      */
-/*      refill the whole stream buffer starting at line_addr + 1,      */
-/*      for STREAMBUF_DEPTH lines, and set stream_buf_next_fetch       */
-/*      to line_addr + 1 + STREAMBUF_DEPTH.                             */
-/*                                                                    */
-/* Verify this against your Week 1 hand-trace before moving on.       */
+/* PREFETCH_STREAMBUF -- IMPLEMENTED (Jouppi, ISCA '90)               */
 /* ---------------------------------------------------------------- */
 
 static long stream_buf[STREAMBUF_DEPTH];
@@ -238,7 +152,13 @@ static int  stream_buf_valid[STREAMBUF_DEPTH];
 static long stream_buf_next_fetch = -1;
 
 static void streambuf_prefetch_on_miss(long missed_line_addr) {
+    /* Refilling: any old slots still marked valid here were never used --
+       count them as wasted so accuracy/MLP bookkeeping stays honest. */
     for (int i = 0; i < STREAMBUF_DEPTH; i++) {
+        if (stream_buf_valid[i]) {
+            stat_prefetches_wasted++;
+            if (outstanding_prefetches > 0) outstanding_prefetches--;
+        }
         stream_buf[i] = missed_line_addr + 1 + i;
         stream_buf_valid[i] = 1;
     }
@@ -262,6 +182,7 @@ static int streambuf_check(long line_addr) {
                 stream_buf_valid[i] = 1;
                 stream_buf_next_fetch++;
                 outstanding_prefetches++;
+                stat_prefetches_issued++;   /* keeps issued/useful/wasted all counting the same events */
             }
             return 1;
         }
@@ -269,23 +190,8 @@ static int streambuf_check(long line_addr) {
     return 0;
 }
 
-
-
-static void streambuf_prefetch_on_miss(long missed_line_addr) {
-    (void)missed_line_addr;
-    /* TODO: refill logic described above */
-}
-
-static int streambuf_check(long line_addr) {
-    (void)line_addr;
-    /* TODO: search logic described above.
-       Return 1 if found (and handle sliding the buffer forward),
-       return 0 if not found. */
-    return 0;
-}
-
 /* ---------------------------------------------------------------- */
-/* Access dispatcher                                                  */
+/* Access dispatcher -- unchanged from the starter                   */
 /* ---------------------------------------------------------------- */
 
 static prefetch_mode_t g_mode = PREFETCH_NONE;
@@ -321,14 +227,14 @@ static void access_address(long byte_addr) {
             case PREFETCH_NEXTLINE:  next_line_prefetch(line_addr); break;
             case PREFETCH_STRIDE:    stride_prefetch(line_addr); break;
             case PREFETCH_STREAMBUF: streambuf_prefetch_on_miss(line_addr); break;
-            default: break; /* PREFETCH_NONE: do nothing extra */
+            default: break;
         }
     }
     mlp_sample();
 }
 
 /* ---------------------------------------------------------------- */
-/* Reporting                                                           */
+/* Reporting -- unchanged from the starter                           */
 /* ---------------------------------------------------------------- */
 
 static const char *mode_name(prefetch_mode_t m) {
