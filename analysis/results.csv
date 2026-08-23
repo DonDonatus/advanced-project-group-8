@@ -1,0 +1,9 @@
+trace,mode,hit_rate,coverage,accuracy,mlp
+stride_regular,none,0.8750,0.0000,0.0000,0.0000
+stride_regular,nextline,0.9375,0.5000,1.0000,0.5000
+stride_regular,stride,0.9062,0.2500,1.0000,0.2500
+stride_regular,streambuf,0.9998,0.9980,0.4981,4.0000
+irregular,none,0.4440,0.0000,0.0000,0.0000
+irregular,nextline,0.4635,0.0853,0.1047,26.2790
+irregular,stride,0.4440,0.0000,0.0000,0.0000
+irregular,streambuf,0.4450,0.0398,0.0102,4.0000
