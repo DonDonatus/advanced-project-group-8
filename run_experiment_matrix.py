@@ -21,7 +21,7 @@ import csv
 import os
 
 SIM_BINARY = "../src/prefetch_sim"
-MODES = ["none", "nextline", "stride", "streambuf"]
+MODES = ["none", "nextline", "stride", "streambuf", "hybrid"]
 TRACES = {
     "stride_regular": "../trace/stride_regular.trace",
     "irregular":      "../trace/irregular.trace",

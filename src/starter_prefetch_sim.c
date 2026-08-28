@@ -8,7 +8,7 @@
  *   gcc -O2 -Wall -o prefetch_sim starter_prefetch_sim.c
  * Run:
  *   ./prefetch_sim <trace_file> <mode>
- *   where <mode> is one of: none | nextline | stride | streambuf
+ *   where <mode> is one of: none | nextline | stride | streambuf | hybrid
  */
 
 #include <stdio.h>
@@ -24,7 +24,8 @@ typedef enum {
     PREFETCH_NONE = 0,
     PREFETCH_NEXTLINE,
     PREFETCH_STRIDE,
-    PREFETCH_STREAMBUF
+    PREFETCH_STREAMBUF,
+    PREFETCH_HYBRID
 } prefetch_mode_t;
 
 /* ---------------------------------------------------------------- */
@@ -191,6 +192,14 @@ static int streambuf_check(long line_addr) {
 }
 
 /* ---------------------------------------------------------------- */
+/* PREFETCH_HYBRID -- correlation + stride arbiter                   */
+/* Included here (not near the top) so it can call cache_find(),     */
+/* cache_insert() and use outstanding_prefetches, all defined above. */
+/* ---------------------------------------------------------------- */
+
+#include "hybrid_prefetch_stub.c"
+
+/* ---------------------------------------------------------------- */
 /* Access dispatcher -- unchanged from the starter                   */
 /* ---------------------------------------------------------------- */
 
@@ -219,6 +228,10 @@ static void access_address(long byte_addr) {
             if (outstanding_prefetches > 0) outstanding_prefetches--;
         }
         cache[slot].last_used_tick = global_tick;
+        /* Hybrid trains its correlation table on every reference, hit or
+           miss (see the WHY note above hybrid_prefetch()); it only issues
+           a prefetch when is_miss is true, so this never affects H6. */
+        if (g_mode == PREFETCH_HYBRID) hybrid_prefetch(line_addr, 0);
     } else {
         stat_misses++;
         cache_insert(line_addr, 0);
@@ -227,6 +240,7 @@ static void access_address(long byte_addr) {
             case PREFETCH_NEXTLINE:  next_line_prefetch(line_addr); break;
             case PREFETCH_STRIDE:    stride_prefetch(line_addr); break;
             case PREFETCH_STREAMBUF: streambuf_prefetch_on_miss(line_addr); break;
+            case PREFETCH_HYBRID:    hybrid_prefetch(line_addr, 1); break;
             default: break;
         }
     }
@@ -243,6 +257,7 @@ static const char *mode_name(prefetch_mode_t m) {
         case PREFETCH_NEXTLINE:  return "nextline";
         case PREFETCH_STRIDE:    return "stride";
         case PREFETCH_STREAMBUF: return "streambuf";
+        case PREFETCH_HYBRID:    return "hybrid";
     }
     return "?";
 }
@@ -272,7 +287,7 @@ static void print_report(const char *trace_name) {
 
 int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: %s <trace_file> <none|nextline|stride|streambuf>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <trace_file> <none|nextline|stride|streambuf|hybrid>\n", argv[0]);
         return 1;
     }
 
@@ -280,6 +295,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[2], "nextline") == 0)  g_mode = PREFETCH_NEXTLINE;
     else if (strcmp(argv[2], "stride") == 0)    g_mode = PREFETCH_STRIDE;
     else if (strcmp(argv[2], "streambuf") == 0) g_mode = PREFETCH_STREAMBUF;
+    else if (strcmp(argv[2], "hybrid") == 0)    g_mode = PREFETCH_HYBRID;
     else {
         fprintf(stderr, "Unknown mode '%s'\n", argv[2]);
         return 1;
@@ -292,6 +308,7 @@ int main(int argc, char **argv) {
     }
 
     cache_init();
+    hybrid_init();
 
     char line[MAX_ADDR_LEN];
     while (fgets(line, sizeof(line), f)) {
