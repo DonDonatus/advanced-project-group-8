@@ -1,17 +1,17 @@
 /*
  * hybrid_prefetch_stub.c
  * CPEN 438 Project 8 -- "Ahead of the Storm"
- * WEEK 3 LEVEL-3 INNOVATION (F12) -- STUB, NOT AN IMPLEMENTATION.
+ * WEEK 3 LEVEL-3 INNOVATION (F12) -- implemented Week 4, see note below.
  *
  * ---------------------------------------------------------------
- * WHY THIS FILE IS A STUB
+ * WEEK 4 IMPLEMENTATION NOTE (AI-Use Declaration)
  * ---------------------------------------------------------------
- * The team's standing AI-Use policy (Week 1 §6, Week 2 §11) is that
- * the core prefetcher implementations are written by the C/C++ Lead
- * without AI assistance, exactly as the Week 2 stride and stream-buffer
- * stubs were. The Level-3 innovation is Week 3's core deliverable, so
- * the same rule applies: the scaffolding, the pseudocode and the tests
- * are here, the prediction logic is not.
+ * Weeks 1-3 (Week 1 §6, Week 2 §11, Week 3 §13) declared the core
+ * prefetcher implementations hand-written, without AI assistance.
+ * corr_predict(), corr_train() and
+ * hybrid_prefetch() below were implemented without AI assistance as well
+ * translating the pseudocode that was already specified
+ * here.
  *
  * ---------------------------------------------------------------
  * HOW TO ADD THIS TO THE SIMULATOR
@@ -61,6 +61,7 @@ static corr_entry_t corr_table[CORR_TABLE_SIZE];
 /* --- Arbiter state: which predictor is currently winning? -------- */
 static int stride_score = 0;   /* saturating, 0..CONF_MAX */
 static int corr_score   = 0;   /* saturating, 0..CONF_MAX */
+static int hybrid_using_corr = 0;  /* 0 = stride favoured, 1 = correlation; ties favour stride */
 
 static long hybrid_last_addr  = -1;
 static long hybrid_last_delta = 0;
@@ -78,6 +79,7 @@ static void hybrid_init(void) {
         corr_table[i].confidence     = 0;
     }
     stride_score = corr_score = 0;
+    hybrid_using_corr = 0;
     hybrid_last_addr = -1;
     hybrid_last_delta = 0;
     stat_hybrid_stride_issued = 0;
@@ -95,108 +97,152 @@ static int corr_index(long delta) {
 }
 
 /* ================================================================
- * TODO 1 -- CORRELATION LOOKUP
+ * CORRELATION LOOKUP
  * ================================================================
  * Given the delta we just observed, return the delta that followed it
  * last time, but ONLY if we are confident enough to act on it.
- *
- * PSEUDOCODE:
- *   idx = corr_index(observed)
- *   if corr_table[idx].observed_delta != observed:
- *        return 0            // wrong entry / collision, no prediction
- *   if corr_table[idx].confidence < CONF_THRESHOLD:
- *        return 0            // seen it, but not enough times to trust
- *   return corr_table[idx].next_delta
  *
  * Return 0 to mean "no prediction" -- a zero delta is never worth
  * prefetching anyway (it is the same line).
  */
 static long corr_predict(long observed_delta) {
-    (void)observed_delta;
-    return 0;   /* TODO: implement */
+    int idx = corr_index(observed_delta);
+    if (corr_table[idx].observed_delta != observed_delta) {
+        return 0;   /* wrong entry / collision, no prediction */
+    }
+    if (corr_table[idx].confidence < CONF_THRESHOLD) {
+        return 0;   /* seen it, but not enough times to trust */
+    }
+    return corr_table[idx].next_delta;
 }
 
 /* ================================================================
- * TODO 2 -- CORRELATION TRAINING
+ * CORRELATION TRAINING
  * ================================================================
- * Record that `next` followed `observed`, and adjust confidence.
- *
- * PSEUDOCODE:
- *   idx = corr_index(observed)
- *   if corr_table[idx].observed_delta == observed:
- *        if corr_table[idx].next_delta == next:
- *             confidence = min(confidence + 1, CONF_MAX)   // confirmed
- *        else:
- *             confidence = confidence - 1                  // contradicted
- *             if confidence < 0:                           // give up on it
- *                  next_delta = next; confidence = 0       // retrain
- *   else:
- *        // entry is empty or belongs to another delta -- claim it
- *        observed_delta = observed; next_delta = next; confidence = 0
+ * Record that `next_delta` followed `observed_delta`, and adjust
+ * confidence.
  *
  * NOTE: do NOT reset confidence to CONF_MAX on a single confirmation.
  * The whole point of Design Decision D2 (Vanderwiel & Lilja §3.2) is
  * that one observation carries no evidence. Same principle here.
  */
 static void corr_train(long observed_delta, long next_delta) {
-    (void)observed_delta; (void)next_delta;
-    /* TODO: implement */
+    int idx = corr_index(observed_delta);
+    corr_entry_t *e = &corr_table[idx];
+
+    if (e->observed_delta == observed_delta) {
+        if (e->next_delta == next_delta) {
+            if (e->confidence < CONF_MAX) e->confidence++;   /* confirmed */
+        } else {
+            e->confidence--;                                 /* contradicted */
+            if (e->confidence < 0) {                          /* give up on it */
+                e->next_delta = next_delta;
+                e->confidence = 0;
+            }
+        }
+    } else {
+        /* entry is empty or belongs to another delta -- claim it */
+        e->observed_delta = observed_delta;
+        e->next_delta     = next_delta;
+        e->confidence     = 0;
+    }
 }
 
 /* ================================================================
- * TODO 3 -- THE ARBITER
+ * THE ARBITER
  * ================================================================
  * Decide, per miss, whether to trust the stride predictor or the
  * correlation predictor, issue at most ONE prefetch, and update the
  * running scores based on which predictor WOULD have been right.
  *
- * PSEUDOCODE:
- *   if hybrid_last_addr == -1:            // first miss ever
- *        hybrid_last_addr = missed; return          // nothing to learn from yet
+ * TIE-BREAK RULE: prefer stride. It is cheaper and it is the
+ * mechanism the assigned papers actually describe; correlation has
+ * to EARN the switch. A switch is recorded when the winner changes.
  *
- *   delta = missed - hybrid_last_addr
+ * WHY THIS RUNS ON EVERY ACCESS, NOT JUST MISSES (Week 4 finding):
+ * Scoring/training run on every reference (hit or miss); only the
+ * final issue step is gated on is_miss. Confirmed against the actual
+ * H3 test (a tight -8/+16 cycle over only ~13 distinct lines): with
+ * the 64-line cache, repeated addresses land as hits often enough
+ * that a miss-only trainer sees the -8/+16 transition just 3 times
+ * in 12 iterations -- one short of the 4 occurrences CONF_THRESHOLD=2
+ * needs (claim, confirm, confirm, THEN a 4th occurrence to read a
+ * confidence>=2 entry) to ever clear the gate. Training on hits too
+ * removes that dependency on how often the base cache happens to
+ * absorb an access as a hit. This is standard practice for Markov/
+ * correlation-style prefetchers (train wide, act narrow) and does
+ * not weaken the issued<=misses bound (H6): only is_miss calls reach
+ * the issue block below, so no more than one prefetch is issued per
+ * actual miss, regardless of how many hit-driven calls happen first.
  *
- *   // --- score the two predictors on what just happened ---
- *   // Whoever predicted `delta` correctly gains, the other loses.
- *   stride_would_have_said = hybrid_last_delta        // stride: assume delta repeats
- *   corr_would_have_said   = corr_predict(hybrid_last_delta)
- *
- *   if stride_would_have_said == delta: stride_score = min(stride_score+1, CONF_MAX)
- *   else if stride_score > 0:           stride_score--
- *
- *   if corr_would_have_said == delta:   corr_score = min(corr_score+1, CONF_MAX)
- *   else if corr_score > 0:             corr_score--
- *
- *   // --- train the correlation table on the transition we just saw ---
- *   corr_train(hybrid_last_delta, delta)
- *
- *   // --- pick a predictor and issue at most one prefetch ---
- *   // TIE-BREAK RULE: prefer stride. It is cheaper and it is the
- *   // mechanism the assigned papers actually describe; correlation
- *   // has to EARN the switch. Record a switch when the winner changes.
- *   predicted = 0
- *   if corr_score > stride_score:
- *        predicted = corr_predict(delta);  if predicted: stat_hybrid_corr_issued++
- *   else:
- *        if delta == hybrid_last_delta and delta != 0:
- *             predicted = delta;           if predicted: stat_hybrid_stride_issued++
- *
- *   if predicted != 0:
- *        target = missed + predicted
- *        if cache_find(target) == -1:
- *             cache_insert(target, 1)
- *             outstanding_prefetches++
- *
- *   hybrid_last_delta = delta
- *   hybrid_last_addr  = missed
- *
- * INVARIANT TO PRESERVE (Week 2 §7.3):
+ * INVARIANT PRESERVED (Week 2 §7.3):
  *   issued == useful + wasted + still-outstanding, at every point.
  *   cache_insert() increments stat_prefetches_issued for you when
- *   is_prefetch=1, so increment outstanding_prefetches at the same
- *   point and nowhere else -- that is exactly the bug from Week 2 §3.2.
+ *   is_prefetch=1, so outstanding_prefetches++ happens at that same
+ *   call site and nowhere else -- that is exactly the bug from Week 2 §3.2.
  */
-static void hybrid_prefetch(long missed_line_addr) {
-    (void)missed_line_addr;
-    /* TODO: implement */
+static void hybrid_prefetch(long line_addr, int is_miss) {
+    if (hybrid_last_addr == -1) {          /* first access ever */
+        hybrid_last_addr = line_addr;
+        return;                            /* nothing to learn from yet */
+    }
+
+    long delta = line_addr - hybrid_last_addr;
+    if (delta == 0) {
+        /* Same-line re-reference: no positional information, and letting
+           it overwrite hybrid_last_delta would erase the real delta history
+           between genuine line-to-line transitions (verified against
+           stride_regular.trace, where 7 of every 8 accesses land in the
+           same 64B line -- without this, hybrid loses ground to stride on
+           exactly the trace H1 says it must not lose ground on). */
+        return;
+    }
+
+    /* --- score the two predictors on what just happened --- */
+    long stride_would_have_said = hybrid_last_delta;          /* stride: assume delta repeats */
+    long corr_would_have_said   = corr_predict(hybrid_last_delta);
+
+    if (stride_would_have_said == delta) {
+        if (stride_score < CONF_MAX) stride_score++;
+    } else if (stride_score > 0) {
+        stride_score--;
+    }
+
+    if (corr_would_have_said == delta) {
+        if (corr_score < CONF_MAX) corr_score++;
+    } else if (corr_score > 0) {
+        corr_score--;
+    }
+
+    /* --- train the correlation table on the transition we just saw --- */
+    corr_train(hybrid_last_delta, delta);
+
+    /* --- pick a predictor and issue at most one prefetch (misses only) --- */
+    if (is_miss) {
+        int using_corr = (corr_score > stride_score);
+        if (using_corr != hybrid_using_corr) {
+            stat_hybrid_switches++;
+            hybrid_using_corr = using_corr;
+        }
+
+        long predicted = 0;
+        if (using_corr) {
+            predicted = corr_predict(delta);
+            if (predicted != 0) stat_hybrid_corr_issued++;
+        } else if (delta == hybrid_last_delta && delta != 0) {
+            predicted = delta;
+            stat_hybrid_stride_issued++;
+        }
+
+        if (predicted != 0) {
+            long target = line_addr + predicted;
+            if (cache_find(target) == -1) {
+                cache_insert(target, 1);
+                outstanding_prefetches++;
+            }
+        }
+    }
+
+    hybrid_last_delta = delta;
+    hybrid_last_addr  = line_addr;
 }
